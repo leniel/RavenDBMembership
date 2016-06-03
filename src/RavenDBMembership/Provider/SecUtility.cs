@@ -6,7 +6,13 @@ using RavenDBMembership.UserStrings;
 
 namespace RavenDBMembership.Provider
 {
-    public class SecUtility
+    public enum PasswordAttemptTypes
+    {
+        PasswordAttempt,
+        PasswordAnswerAttempt
+    }
+
+public class SecUtility
     {
         internal static bool ValidateParameter(ref string param, bool checkForNull, bool checkIfEmpty, bool checkForCommas, int maxSize)
         {

@@ -1,80 +1,64 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Configuration.Provider;
-using System.Linq;
-using System.Web.Security;
-using Raven.Abstractions.Exceptions;
-using Raven.Client;
-using Microsoft.Practices.ServiceLocation;
-using System.Collections.Specialized;
-
-namespace RavenDBMembership.Provider
+﻿namespace RavenDBMembership.Provider
 {
-    public class RavenDBMembershipProvider : MembershipProviderValidated
+    using Raven.Client;
+    using Raven.Client.Document;
+    using Raven.Client.Embedded;
+    using RavenDBMembership;
+    using System;
+    using System.Collections.Generic;
+    using System.Collections.Specialized;
+    using System.Configuration;
+    using System.Configuration.Provider;
+    using System.Diagnostics;
+    using System.Linq;
+    using System.Runtime.CompilerServices;
+    using System.Runtime.InteropServices;
+    using System.Text;
+    using System.Web;
+    using System.Web.Configuration;
+    using System.Web.Hosting;
+    using System.Web.Security;
+
+    public class RavenDBMembershipProvider : MembershipProvider
     {
-        private string _providerName = "RavenDBMembership";
-        private IDocumentStore documentStore;
-        private int _minRequiredPasswordLength = 7;
+        private static IDocumentStore _documentStore;
+        private bool _enablePasswordReset;
+        private bool _enablePasswordRetrieval;
+        private string _hashAlgorithm;
+        private int _maxInvalidPasswordAttempts;
+        private int _minRequiredNonAlphanumericCharacters;
+        private int _minRequiredPasswordLength;
+        private int _passwordAttemptWindow;
+        private MembershipPasswordFormat _passwordFormat;
+        private string _passwordStrengthRegularExpression;
+        private bool _requiresQuestionAndAnswer;
+        private bool _requiresUniqueEmail;
+        private string _validationKey;
+        private const string ProviderName = "RavenDBMembership";
 
-        public IDocumentStore DocumentStore
+        public static void AttachTo(IDocumentStore documentStore)
         {
-            get 
-            {
-                if (documentStore == null)
-                {
-                    throw new NullReferenceException("The DocumentStore is not set. Please set the DocumentStore or make sure that the Common Service Locator can find the IDocumentStore and call Initialize on this provider.");
-                }
-                return this.documentStore;
-            }
-            set { this.documentStore = value; }
+            _documentStore = documentStore;
         }
 
-        public override string ApplicationName
+        public override bool ChangePassword(string username, string oldPassword, string newPassword)
         {
-            get; set;
-        }
-
-        public override void Initialize(string name, NameValueCollection config)
-        {
-            if (config.Keys.Cast<string>().Contains("minRequiredPasswordLength"))
+            ValidatePasswordEventArgs e = new ValidatePasswordEventArgs(username, newPassword, false);
+            this.OnValidatingPassword(e);
+            if(e.Cancel)
             {
-                _minRequiredPasswordLength = int.Parse(config["minRequiredPasswordLength"]);
+                throw new MembershipPasswordException("The new password is not valid.");
             }
-            
-            // Try to find an IDocumentStore via Common Service Locator. 
-            try
+            using(IDocumentSession session = DocumentStore.OpenSession())
             {
-                var locator = ServiceLocator.Current;
-                if (locator != null)
+                User user = (from u in session.Query<User>()
+                             where (u.Username == username) && (u.ApplicationName == this.ApplicationName)
+                             select u).SingleOrDefault<User>();
+                if(!this.ValidateUser(username, oldPassword))
                 {
-                    this.DocumentStore = locator.GetInstance<IDocumentStore>();
+                    throw new MembershipPasswordException("Invalid username or old password. You must supply valid credentials to change your password.");
                 }
-            }
-            catch (NullReferenceException) // Swallow Nullreference expection that occurs when there is no current service locator.
-            {
-            }
-
-            _providerName = name;
-            
-            base.Initialize(name, config);
-        }
-
-        public override bool CheckedChangePassword(string username, string oldPassword, string newPassword)
-        {
-            using (var session = this.DocumentStore.OpenSession())
-            {
-                var q = from u in session.Query<User>()
-                        where u.Username == username && u.ApplicationName == this.ApplicationName
-                        select u;
-                var user = q.SingleOrDefault();
-                if (user == null || user.PasswordHash != PasswordUtil.HashPassword(oldPassword, user.PasswordSalt))
-                {
-                    throw new MembershipPasswordException("Invalid username or old password.");
-                }
-
-                user.PasswordSalt = PasswordUtil.CreateRandomSalt();
-                user.PasswordHash = PasswordUtil.HashPassword(newPassword, user.PasswordSalt);
-
+                user.PasswordHash = this.EncodePassword(newPassword, user.PasswordSalt);
                 session.SaveChanges();
             }
             return true;
@@ -82,371 +66,649 @@ namespace RavenDBMembership.Provider
 
         public override bool ChangePasswordQuestionAndAnswer(string username, string password, string newPasswordQuestion, string newPasswordAnswer)
         {
-            throw new NotImplementedException();
+            if(!this.ValidateUser(username, password))
+            {
+                throw new MembershipPasswordException("You must supply valid credentials to change your question and answer.");
+            }
+            using(IDocumentSession session = DocumentStore.OpenSession())
+            {
+                User user = (from u in session.Query<User>()
+                             where (u.Username == username) && (u.ApplicationName == this.ApplicationName)
+                             select u).SingleOrDefault<User>();
+                user.PasswordQuestion = newPasswordQuestion;
+                user.PasswordAnswer = this.EncodePassword(newPasswordAnswer, user.PasswordSalt);
+                session.SaveChanges();
+            }
+            return true;
         }
 
-        public override MembershipUser CheckedCreateUser(string username, string password, string email, string passwordQuestion, string passwordAnswer, bool isApproved, object providerUserKey, out MembershipCreateStatus status)
+        public override MembershipUser CreateUser(string username, string password, string email, string passwordQuestion, string passwordAnswer, bool isApproved, object providerUserKey, out MembershipCreateStatus status)
         {
-            if (password.Length < MinRequiredPasswordLength)
-                throw new MembershipCreateUserException(MembershipCreateStatus.InvalidPassword);
-
-            ValidatePasswordEventArgs args = new ValidatePasswordEventArgs(username, password, true);
-            OnValidatingPassword(args);
-            if (args.Cancel)
+            User user;
+            ValidatePasswordEventArgs e = new ValidatePasswordEventArgs(username, password, true);
+            this.OnValidatingPassword(e);
+            if(e.Cancel)
             {
                 status = MembershipCreateStatus.InvalidPassword;
                 return null;
             }
 
-            var user = new User();
-            user.Username = username;
-            password = password.Trim();
-            user.PasswordSalt = PasswordUtil.CreateRandomSalt();
-            user.PasswordHash = PasswordUtil.HashPassword(password, user.PasswordSalt);
-            user.Email = email;
-            user.ApplicationName = this.ApplicationName;
-            user.DateCreated = DateTime.Now;
-
-            using (var session = this.DocumentStore.OpenSession())
+            if((this._enablePasswordReset || this._enablePasswordRetrieval) && (this._requiresQuestionAndAnswer && string.IsNullOrEmpty(passwordAnswer)))
             {
-                session.Advanced.UseOptimisticConcurrency = true;
+                throw new ArgumentException("Requires question and answer is set to true and a question and answer were not provided.");
+            }
 
-                try
+            var salt = PasswordUtil.CreateRandomSalt();
+
+            user = new User
+            {
+                Username = username,
+                PasswordSalt = salt,
+                PasswordHash = this.EncodePassword(password, salt),
+                Email = email,
+                ApplicationName = this.ApplicationName,
+                DateCreated = DateTime.Now,
+                PasswordQuestion = passwordQuestion,
+                PasswordAnswer = string.IsNullOrEmpty(passwordAnswer) ? passwordAnswer : this.EncodePassword(passwordAnswer, salt),
+                IsApproved = isApproved,
+                IsLockedOut = false,
+                IsOnline = false
+            };
+
+            using(IDocumentSession session = DocumentStore.OpenSession())
+            {
+                if(this.RequiresUniqueEmail && ((from x in session.Query<User>()
+                                                 where (x.Email == email) && (x.ApplicationName == this.ApplicationName)
+                                                 select x).FirstOrDefault<User>() != null))
                 {
-                    session.Store(user);
-                    session.Store(new ReservationForUniqueFieldValue { Id = "username/" + user.Username });
-                    session.Store(new ReservationForUniqueFieldValue { Id = "email/" + user.Email });
+                    status = MembershipCreateStatus.DuplicateEmail;
+                    return null;
+                }
+                session.Store(user);
+                session.SaveChanges();
+                status = MembershipCreateStatus.Success;
+                return new MembershipUser("RavenDBMembership", username, user.Id, email, passwordQuestion, user.Comment, isApproved, false, user.DateCreated, new DateTime(0x76c, 1, 1), new DateTime(0x76c, 1, 1), DateTime.Now, new DateTime(0x76c, 1, 1));
+            }
+        }
 
+        public MembershipUser CreateUser(string username, string password, string email, string fullName, string passwordQuestion, string passwordAnswer, bool isApproved, object providerUserKey, out MembershipCreateStatus status)
+        {
+            MembershipUser user = this.CreateUser(username, password, email, passwordQuestion, passwordAnswer, isApproved, providerUserKey, out status);
+            if(user != null)
+            {
+                using(IDocumentSession session = _documentStore.OpenSession())
+                {
+                    session.Load<User>(user.ProviderUserKey.ToString()).FullName = fullName;
                     session.SaveChanges();
-
-                    status = MembershipCreateStatus.Success;
-
-                    return new MembershipUser(_providerName, username, user.Id, email, null, null, true, false, user.DateCreated,
-                        new DateTime(1900, 1, 1), new DateTime(1900, 1, 1), DateTime.Now, new DateTime(1900, 1, 1));
-                }
-                catch (ConcurrencyException e)
-                {
-                    status = InterpretConcurrencyException(user.Username, user.Email, e);
-                }
-                catch (Exception ex)
-                {
-                    // TODO: log exception properly
-                    Console.WriteLine(ex.ToString());
-                    status = MembershipCreateStatus.ProviderError;
                 }
             }
-            return null;
+            return user;
         }
 
-        MembershipCreateStatus InterpretConcurrencyException(string username, string email, ConcurrencyException e)
+        public override bool DeleteUser(string username, bool deleteAllRelatedData)
         {
-            MembershipCreateStatus status;
-            if (e.Message.Contains("username/" + username))
-                status = MembershipCreateStatus.DuplicateUserName;
-            else if (e.Message.Contains("email/" + email))
-                status = MembershipCreateStatus.DuplicateEmail;
-            else
+            bool flag;
+            IDocumentSession session = DocumentStore.OpenSession();
+            try
             {
-                status = MembershipCreateStatus.ProviderError;
-            }
-            return status;
-        }
-
-        public override bool CheckedDeleteUser(string username, bool deleteAllRelatedData)
-        {
-            using (var session = this.DocumentStore.OpenSession())
-            {
-                try
+                User entity = (from u in session.Query<User>()
+                               where (u.Username == username) && (u.ApplicationName == this.ApplicationName)
+                               select u).SingleOrDefault<User>();
+                if(entity == null)
                 {
-                    var q = from u in session.Query<User>().Customize(c => c.WaitForNonStaleResultsAsOfNow())
-                            where u.Username == username && u.ApplicationName == this.ApplicationName
-                            select u;
-                    var user = q.SingleOrDefault();
-                    if (user == null)
+                    throw new NullReferenceException("The user could not be deleted, they don't exist.");
+                }
+                session.Delete<User>(entity);
+                session.SaveChanges();
+                flag = true;
+            }
+            catch(Exception exception)
+            {
+                EventLog.WriteEntry(this.ApplicationName, exception.ToString());
+                flag = false;
+            }
+            finally
+            {
+                if(session != null)
+                {
+                    session.Dispose();
+                }
+            }
+            return flag;
+        }
+
+        private string EncodePassword(string password, string salt)
+        {
+            string str = password;
+            switch(this._passwordFormat)
+            {
+                case MembershipPasswordFormat.Clear:
+                    return str;
+
+                case MembershipPasswordFormat.Hashed:
+                    if(string.IsNullOrEmpty(salt))
                     {
-                        throw new NullReferenceException("The user could not be deleted.");
+                        throw new ProviderException("A random salt is required with hashed passwords.");
                     }
+                    return PasswordUtil.HashPassword(password, salt, this._hashAlgorithm, this._validationKey);
 
-                    session.Delete(session.Load<ReservationForUniqueFieldValue>("username/" + user.Username));
-                    session.Delete(session.Load<ReservationForUniqueFieldValue>("email/" + user.Email));
+                case MembershipPasswordFormat.Encrypted:
+                    return Convert.ToBase64String(this.EncryptPassword(Encoding.Unicode.GetBytes(password)));
+            }
+            throw new ProviderException("Unsupported password format.");
+        }
 
-                    session.Delete(user);
-                    session.SaveChanges();
-                    return true;
-                }
-                catch (Exception ex)
+        private MembershipUserCollection FindUsers(Func<User, bool> predicate, int pageIndex, int pageSize, out int totalRecords)
+        {
+            MembershipUserCollection users = new MembershipUserCollection();
+            using(IDocumentSession session = DocumentStore.OpenSession())
+            {
+                IEnumerable<User> enumerable;
+                IQueryable<User> source = from u in session.Query<User>()
+                                          where u.ApplicationName == this.ApplicationName
+                                          select u;
+                if(predicate != null)
                 {
-                    // TODO: log exception properly
-                    Console.WriteLine(ex.ToString());
-                    return false;
+                    enumerable = source.Where<User>(predicate);
+                }
+                else
+                {
+                    enumerable = source;
+                }
+                totalRecords = enumerable.Count<User>();
+                foreach(User user in enumerable.Skip<User>((pageIndex * pageSize)).Take<User>(pageSize))
+                {
+                    users.Add(this.UserToMembershipUser(user));
                 }
             }
-        }
-
-        public override bool EnablePasswordReset
-        {
-            get { return true; }
-        }
-
-        public override bool EnablePasswordRetrieval
-        {
-            get { return false; }
+            return users;
         }
 
         public override MembershipUserCollection FindUsersByEmail(string emailToMatch, int pageIndex, int pageSize, out int totalRecords)
         {
-            return FindUsers(u => u.Email.Contains(emailToMatch), pageIndex, pageSize, out totalRecords);
+            return this.FindUsers(u => u.Email.Contains(emailToMatch), pageIndex, pageSize, out totalRecords);
         }
 
         public override MembershipUserCollection FindUsersByName(string usernameToMatch, int pageIndex, int pageSize, out int totalRecords)
         {
-            return FindUsers(u => u.Username.Contains(usernameToMatch), pageIndex, pageSize, out totalRecords);
+            return this.FindUsers(u => u.Username.Contains(usernameToMatch), pageIndex, pageSize, out totalRecords);
         }
 
         public override MembershipUserCollection GetAllUsers(int pageIndex, int pageSize, out int totalRecords)
         {
-            return FindUsers(null, pageIndex, pageSize, out totalRecords);
+            return this.FindUsers(null, pageIndex, pageSize, out totalRecords);
+        }
+
+        private string GetConfigValue(string value, string defaultValue)
+        {
+            if(string.IsNullOrEmpty(value))
+            {
+                return defaultValue;
+            }
+            return value;
         }
 
         public override int GetNumberOfUsersOnline()
         {
-            throw new NotImplementedException();
+            using(IDocumentSession session = DocumentStore.OpenSession())
+            {
+                return (from u in session.Query<User>()
+                        where (u.ApplicationName == this.ApplicationName) && u.IsOnline
+                        select u).Count<User>();
+            }
         }
 
         public override string GetPassword(string username, string answer)
         {
-            throw new NotImplementedException();
+            if(!this.EnablePasswordRetrieval)
+            {
+                throw new NotSupportedException("Password retrieval feature is not supported.");
+            }
+            if(this.PasswordFormat == MembershipPasswordFormat.Hashed)
+            {
+                throw new NotSupportedException("Password retrieval is not supported with hashed passwords.");
+            }
+            User user = null;
+            using(IDocumentSession session = _documentStore.OpenSession())
+            {
+                user = (from u in session.Query<User>()
+                        where (u.Username == username) && (u.ApplicationName == this.ApplicationName)
+                        select u).SingleOrDefault<User>();
+                if(user == null)
+                {
+                    throw new NullReferenceException("The specified user does not exist.");
+                }
+                string str = this.EncodePassword(answer, user.PasswordSalt);
+                if(this.RequiresQuestionAndAnswer && (user.PasswordAnswer != str))
+                {
+                    user.FailedPasswordAnswerAttempts++;
+                    session.SaveChanges();
+                    throw new MembershipPasswordException("The password question's answer is incorrect.");
+                }
+            }
+            if(this.PasswordFormat == MembershipPasswordFormat.Clear)
+            {
+                return user.PasswordHash;
+            }
+            return this.UnEncodePassword(user.PasswordHash, user.PasswordSalt);
         }
 
-        public override MembershipUser GetUser(string username, bool userIsOnline)
+        private User GetRavenDbUser(string username, bool userIsOnline)
         {
-            using (var session = this.DocumentStore.OpenSession())
+            using(IDocumentSession session = _documentStore.OpenSession())
             {
-                var q = from u in session.Query<User>().Customize(c => c.WaitForNonStaleResultsAsOfNow())
-                        where u.Username == username && u.ApplicationName == this.ApplicationName
-                        select u;
-                var user = q.SingleOrDefault();
-                if (user != null)
-                {
-                    return UserToMembershipUser(user);
-                }
-                return null;
+                User user = (from u in session.Query<User>()
+                             where (u.Username == username) && (u.ApplicationName == this.ApplicationName)
+                             select u).SingleOrDefault<User>();
+                user.IsOnline = userIsOnline;
+                session.SaveChanges();
+                return user;
             }
         }
 
         public override MembershipUser GetUser(object providerUserKey, bool userIsOnline)
         {
-            using (var session = this.DocumentStore.OpenSession())
+            using(IDocumentSession session = DocumentStore.OpenSession())
             {
-                var user = session.Load<User>(providerUserKey.ToString());
-                if (user != null)
+                User user = session.Load<User>(providerUserKey.ToString());
+                if(user != null)
                 {
-                    return UserToMembershipUser(user);
+                    return this.UserToMembershipUser(user);
                 }
                 return null;
             }
         }
 
+        public override MembershipUser GetUser(string username, bool userIsOnline)
+        {
+            User ravenDbUser = this.GetRavenDbUser(username, userIsOnline);
+            if(ravenDbUser != null)
+            {
+                return this.UserToMembershipUser(ravenDbUser);
+            }
+            return null;
+        }
+
         public override string GetUserNameByEmail(string email)
         {
-            using (var session = this.DocumentStore.OpenSession())
+            using(IDocumentSession session = DocumentStore.OpenSession())
             {
-                var q = from u in session.Query<User>()
-                        where u.Email == email && u.ApplicationName == this.ApplicationName
-                        select u.Username;
-                return q.SingleOrDefault();
+                return (from u in session.Query<User>()
+                        where (u.Email == email) && (u.ApplicationName == this.ApplicationName)
+                        select u.Username).SingleOrDefault<string>();
             }
         }
 
-        public override int MaxInvalidPasswordAttempts
+        private void InitConfigSettings(NameValueCollection config)
         {
-            get { return 10; }
+            this.ApplicationName = this.GetConfigValue(config["applicationName"], HostingEnvironment.ApplicationVirtualPath);
+            this._maxInvalidPasswordAttempts = Convert.ToInt32(this.GetConfigValue(config["maxInvalidPasswordAttempts"], "5"));
+            this._passwordAttemptWindow = Convert.ToInt32(this.GetConfigValue(config["passwordAttemptWindow"], "10"));
+            this._minRequiredNonAlphanumericCharacters = Convert.ToInt32(this.GetConfigValue(config["minRequiredAlphaNumericCharacters"], "1"));
+            this._minRequiredPasswordLength = Convert.ToInt32(this.GetConfigValue(config["minRequiredPasswordLength"], "7"));
+            this._passwordStrengthRegularExpression = Convert.ToString(this.GetConfigValue(config["passwordStrengthRegularExpression"], string.Empty));
+            this._enablePasswordReset = Convert.ToBoolean(this.GetConfigValue(config["enablePasswordReset"], "true"));
+            this._enablePasswordRetrieval = Convert.ToBoolean(this.GetConfigValue(config["enablePasswordRetrieval"], "true"));
+            this._requiresQuestionAndAnswer = Convert.ToBoolean(this.GetConfigValue(config["requiresQuestionAndAnswer"], "false"));
+            this._requiresUniqueEmail = Convert.ToBoolean(this.GetConfigValue(config["requiresUniqueEmail"], "true"));
         }
 
-        public override int MinRequiredNonAlphanumericCharacters
+        public override void Initialize(string name, NameValueCollection config)
         {
-            get { return 0; }
+            if(config == null)
+            {
+                throw new ArgumentNullException("There are no membership configuration settings.");
+            }
+            if(string.IsNullOrEmpty(name))
+            {
+                name = "RavenDBMembershipProvider";
+            }
+            if(string.IsNullOrEmpty(config["description"]))
+            {
+                config["description"] = "An Asp.Net membership provider for the RavenDB document database.";
+            }
+            base.Initialize(name, config);
+            this.InitConfigSettings(config);
+            this.InitPasswordEncryptionSettings(config);
+            if(_documentStore == null)
+            {
+                if(string.IsNullOrEmpty(ConfigurationManager.ConnectionStrings[config["connectionStringName"]].ConnectionString))
+                {
+                    throw new ProviderException("The connection string name must be set.");
+                }
+                if(string.IsNullOrEmpty(config["enableEmbeddableDocumentStore"]))
+                {
+                    throw new ProviderException("RavenDB can run as a service or embedded mode, you must set enableEmbeddableDocumentStore in the web.config.");
+                }
+                if(Convert.ToBoolean(config["enableEmbeddableDocumentStore"]))
+                {
+                    EmbeddableDocumentStore store = new EmbeddableDocumentStore
+                    {
+                       ConnectionStringName = config["connectionStringName"]
+                       //DataDirectory = "Data",
+                       //RunInMemory = true
+                    };
+
+                    _documentStore = store;
+
+                    RavenDBMembershipProvider.AttachTo(_documentStore);
+                    RavenDBRoleProvider.AttachTo(_documentStore);
+                }
+                else
+                {
+                    DocumentStore store2 = new DocumentStore
+                    {
+                        ConnectionStringName = config["connectionStringName"]
+                    };
+
+                    _documentStore = store2;
+                }
+
+                _documentStore.Initialize();
+            }
         }
 
-        public override int MinRequiredPasswordLength { get { return _minRequiredPasswordLength; } }
-
-        public override int PasswordAttemptWindow
+        private void InitPasswordEncryptionSettings(NameValueCollection config)
         {
-            get { return 5; }
+            MachineKeySection section = WebConfigurationManager.OpenWebConfiguration(HostingEnvironment.ApplicationVirtualPath).GetSection("system.web/machineKey") as MachineKeySection;
+            this._hashAlgorithm = section.ValidationAlgorithm;
+            this._validationKey = section.ValidationKey;
+            if(section.ValidationKey.Contains("AutoGenerate") && (this.PasswordFormat != MembershipPasswordFormat.Clear))
+            {
+                throw new ProviderException("Hashed or Encrypted passwords are not supported with auto-generated keys.");
+            }
+            string str = config["passwordFormat"];
+            if(str == null)
+            {
+                str = "Hashed";
+            }
+            switch(str)
+            {
+                case "Hashed":
+                    this._passwordFormat = MembershipPasswordFormat.Hashed;
+                    return;
+
+                case "Encrypted":
+                    this._passwordFormat = MembershipPasswordFormat.Encrypted;
+                    return;
+
+                case "Clear":
+                    this._passwordFormat = MembershipPasswordFormat.Clear;
+                    return;
+            }
+            throw new ProviderException("The password format from the custom provider is not supported.");
         }
 
-        public override MembershipPasswordFormat PasswordFormat
+        private bool IsLockedOutValidationHelper(User user)
         {
-            get { return MembershipPasswordFormat.Hashed; }
-        }
-
-        public override string PasswordStrengthRegularExpression
-        {
-            get { return String.Empty; }
-        }
-
-        public override bool RequiresQuestionAndAnswer
-        {
-            get { return false; }
-        }
-
-        public override bool RequiresUniqueEmail
-        {
-            get { return false; }
+            long num = DateTime.Now.Ticks - user.LastFailedPasswordAttempt.Ticks;
+            return ((user.FailedPasswordAttempts >= this.MaxInvalidPasswordAttempts) && (num < this.PasswordAttemptWindow));
         }
 
         public override string ResetPassword(string username, string answer)
         {
-            using (var session = this.DocumentStore.OpenSession())
+            string str2;
+            if(!this.EnablePasswordReset)
             {
-                try
+                throw new ProviderException("Password reset is not enabled.");
+            }
+            IDocumentSession session = DocumentStore.OpenSession();
+            try
+            {
+                User user = (from u in session.Query<User>()
+                             where (u.Username == username) && (u.ApplicationName == this.ApplicationName)
+                             select u).SingleOrDefault<User>();
+                if(user == null)
                 {
-                    var q = from u in session.Query<User>()
-                            where u.Username == username && u.ApplicationName == this.ApplicationName
-                            select u;
-                    var user = q.SingleOrDefault();
-                    if (user == null)
-                    {
-                        throw new Exception("The user to reset the password for could not be found.");
-                    }
-                    var newPassword = Membership.GeneratePassword(8, 2);
-                    user.PasswordSalt = PasswordUtil.CreateRandomSalt();
-                    user.PasswordHash = PasswordUtil.HashPassword(newPassword, user.PasswordSalt);
-
-                    session.SaveChanges();
-                    return newPassword;
+                    throw new HttpException("The user to reset the password for could not be found.");
                 }
-                catch (Exception ex)
+                if(user.PasswordAnswer != this.EncodePassword(answer, user.PasswordSalt))
                 {
-                    // TODO: log exception properly
-                    Console.WriteLine(ex.ToString());
-                    throw;
+                    user.FailedPasswordAttempts++;
+                    session.SaveChanges();
+                    throw new MembershipPasswordException("The password question's answer is incorrect.");
+                }
+                string password = Membership.GeneratePassword(8, 2);
+                user.PasswordHash = this.EncodePassword(password, user.PasswordSalt);
+                session.SaveChanges();
+                str2 = password;
+            }
+            catch(Exception exception)
+            {
+                EventLog.WriteEntry(this.ApplicationName, exception.ToString());
+                throw;
+            }
+            finally
+            {
+                if(session != null)
+                {
+                    session.Dispose();
                 }
             }
+            return str2;
+        }
+
+        private void SaveRavenUser(User user)
+        {
+            using(IDocumentSession session = _documentStore.OpenSession())
+            {
+                session.Store(user);
+                session.SaveChanges();
+            }
+        }
+
+        private string UnEncodePassword(string encodedPassword, string salt)
+        {
+            string s = encodedPassword;
+            switch(this._passwordFormat)
+            {
+                case MembershipPasswordFormat.Clear:
+                    return s;
+
+                case MembershipPasswordFormat.Hashed:
+                    throw new ProviderException("Hashed passwords do not require decoding, just compare hashes.");
+
+                case MembershipPasswordFormat.Encrypted:
+                    return Encoding.Unicode.GetString(this.DecryptPassword(Convert.FromBase64String(s)));
+            }
+            throw new ProviderException("Unsupported password format.");
         }
 
         public override bool UnlockUser(string userName)
         {
-            throw new NotImplementedException();
+            using(IDocumentSession session = DocumentStore.OpenSession())
+            {
+                User user = (from x in session.Query<User>()
+                             where (x.Username == userName) && (x.ApplicationName == this.ApplicationName)
+                             select x).SingleOrDefault<User>();
+                if(user == null)
+                {
+                    return false;
+                }
+                user.IsLockedOut = false;
+                session.SaveChanges();
+                return true;
+            }
+        }
+
+        private User UpdatePasswordAttempts(User u, PasswordAttemptTypes attemptType, bool signedInOk)
+        {
+            long num = DateTime.Now.Ticks - u.LastFailedPasswordAttempt.Ticks;
+            if(signedInOk || (num > this.PasswordAttemptWindow))
+            {
+                u.LastFailedPasswordAttempt = new DateTime(0x76c, 1, 1);
+                u.FailedPasswordAttempts = 0;
+                u.FailedPasswordAnswerAttempts = 0;
+                this.SaveRavenUser(u);
+                return u;
+            }
+            u.LastFailedPasswordAttempt = DateTime.Now;
+            if(attemptType == PasswordAttemptTypes.PasswordAttempt)
+            {
+                u.FailedPasswordAttempts++;
+            }
+            else
+            {
+                u.FailedPasswordAnswerAttempts++;
+            }
+            if((u.FailedPasswordAttempts > this.MaxInvalidPasswordAttempts) || (u.FailedPasswordAnswerAttempts > this.MaxInvalidPasswordAttempts))
+            {
+                u.IsLockedOut = true;
+            }
+            this.SaveRavenUser(u);
+            return u;
         }
 
         public override void UpdateUser(MembershipUser user)
         {
-            if (user == null)
+            using(IDocumentSession session = DocumentStore.OpenSession())
             {
-                throw new ArgumentNullException("user");
-            }
-            string username = user.UserName;
-            SecUtility.CheckParameter(ref username, true, true, true, 0x100, "UserName");
-            
-            string email = user.Email;
-            SecUtility.CheckParameter(ref email, this.RequiresUniqueEmail, this.RequiresUniqueEmail, false, 0x100, "Email");
-            user.Email = email;
-
-            using (var session = this.DocumentStore.OpenSession())
-            {
-                session.Advanced.UseOptimisticConcurrency = true;
-
-                try
+                User user2 = (from u in session.Query<User>()
+                              where (u.Username == user.UserName) && (u.ApplicationName == this.ApplicationName)
+                              select u).SingleOrDefault<User>();
+                if(user2 == null)
                 {
-                    var q = from u in session.Query<User>()
-                            where u.Username == user.UserName && u.ApplicationName == this.ApplicationName
-                            select u;
-                    var dbUser = q.SingleOrDefault();
-                    if (dbUser == null)
-                    {
-                        throw new Exception("The user to update could not be found.");
-                    }
-
-                    var originalEmail = dbUser.Email;
-
-                    if (originalEmail != user.Email)
-                    {
-                        session.Delete(session.Load<ReservationForUniqueFieldValue>("email/" + dbUser.Email));
-                        session.Store(new ReservationForUniqueFieldValue { Id = "email/" + user.Email});
-                    }
-
-                    dbUser.Username = user.UserName;
-                    dbUser.Email = user.Email;
-                    dbUser.DateCreated = user.CreationDate;
-                    dbUser.DateLastLogin = user.LastLoginDate;
-
-                    session.SaveChanges();
+                    throw new HttpException("The user to update could not be found.");
                 }
-                catch(ConcurrencyException ex)
-                {
-                    var status = InterpretConcurrencyException(user.UserName, user.Email, ex);
-
-                    if (status == MembershipCreateStatus.DuplicateEmail)
-                        throw new ProviderException("The E-mail supplied is invalid.");
-                    else
-                        throw;
-                }
+                user2.Username = user.UserName;
+                user2.Email = user.Email;
+                user2.DateCreated = user.CreationDate;
+                user2.DateLastLogin = new DateTime?(user.LastLoginDate);
+                user2.IsOnline = user.IsOnline;
+                user2.IsApproved = user.IsApproved;
+                user2.IsLockedOut = user.IsLockedOut;
+                session.SaveChanges();
             }
+        }
+
+        private MembershipUser UserToMembershipUser(User user)
+        {
+            return new MembershipUser("RavenDBMembership", user.Username, user.Id, user.Email, user.PasswordQuestion, user.Comment, user.IsApproved, user.IsLockedOut, user.DateCreated, user.DateLastLogin.HasValue ? user.DateLastLogin.Value : new DateTime(0x76c, 1, 1), new DateTime(0x76c, 1, 1), new DateTime(0x76c, 1, 1), new DateTime(0x76c, 1, 1));
         }
 
         public override bool ValidateUser(string username, string password)
         {
-            var updateLastLogin = true;
-
-            return CheckPassword(username, password, updateLastLogin);
-        }
-
-        public override bool CheckPassword(string username, string password, bool updateLastLogin)
-        {
-            username = username.Trim();
-            password = password.Trim();
-
-            using (var session = this.DocumentStore.OpenSession())
+            if(!string.IsNullOrEmpty(username))
             {
-                var q = from u in session.Query<User>().Customize(c => c.WaitForNonStaleResultsAsOfNow())
-                        where u.Username == username && u.ApplicationName == this.ApplicationName
-                        select u;
-                var user = q.SingleOrDefault();
-                if (user != null && user.PasswordHash == PasswordUtil.HashPassword(password, user.PasswordSalt))
+                using(IDocumentSession session = DocumentStore.OpenSession())
                 {
-                    if (updateLastLogin)
+                    User user = (from u in session.Query<User>()
+                                 where u.Username == username
+                                 select u).SingleOrDefault<User>();
+                    if(user == null)
                     {
-                        user.DateLastLogin = DateTime.Now;
+                        return false;
                     }
+                    if(user.PasswordHash == this.EncodePassword(password, user.PasswordSalt))
+                    {
+                        user.DateLastLogin = new DateTime?(DateTime.Now);
+                        user.IsOnline = true;
+                        user.FailedPasswordAttempts = 0;
+                        user.FailedPasswordAnswerAttempts = 0;
+                        session.SaveChanges();
+                        return true;
+                    }
+                    user.LastFailedPasswordAttempt = DateTime.Now;
+                    user.FailedPasswordAttempts++;
+                    user.IsLockedOut = this.IsLockedOutValidationHelper(user);
                     session.SaveChanges();
-                    return true;
                 }
             }
             return false;
         }
 
-        private MembershipUserCollection FindUsers(Func<User, bool> predicate, int pageIndex, int pageSize, out int totalRecords)
+        public override string ApplicationName { get; set; }
+
+        public static IDocumentStore DocumentStore
         {
-            var membershipUsers = new MembershipUserCollection();
-            using (var session = this.DocumentStore.OpenSession())
+            get
             {
-                var q = from u in session.Query<User>()
-                            where u.ApplicationName == this.ApplicationName
-                        select u;
-                IEnumerable<User> results;
-                if (predicate != null)
-                {
-                    results = q.Where(predicate);
-                }
-                else
-                {
-                    results = q;
-                }
-                totalRecords = results.Count();
-                var pagedUsers = results.Skip(pageIndex * pageSize).Take(pageSize);
-                foreach (var user in pagedUsers)
-                {
-                    membershipUsers.Add(UserToMembershipUser(user));
-                }
+                return _documentStore;
             }
-            return membershipUsers;
+            set
+            {
+                _documentStore = value;
+            }
         }
 
-        private MembershipUser UserToMembershipUser(User user)
+        public override bool EnablePasswordReset
         {
-            return new RavenDBMembershipUser(_providerName, user.Username, user.Id, user.Email, null, null, true, false
-                , user.DateCreated, user.DateLastLogin.HasValue ? user.DateLastLogin.Value : new DateTime(1900, 1, 1), new DateTime(1900, 1, 1), new DateTime(1900, 1, 1), new DateTime(1900, 1, 1));
+            get
+            {
+                return this._enablePasswordReset;
+            }
+        }
+
+        public override bool EnablePasswordRetrieval
+        {
+            get
+            {
+                return this._enablePasswordRetrieval;
+            }
+        }
+
+        public override int MaxInvalidPasswordAttempts
+        {
+            get
+            {
+                return this._maxInvalidPasswordAttempts;
+            }
+        }
+
+        public override int MinRequiredNonAlphanumericCharacters
+        {
+            get
+            {
+                return this._minRequiredNonAlphanumericCharacters;
+            }
+        }
+
+        public override int MinRequiredPasswordLength
+        {
+            get
+            {
+                return this._minRequiredPasswordLength;
+            }
+        }
+
+        public override int PasswordAttemptWindow
+        {
+            get
+            {
+                return this._passwordAttemptWindow;
+            }
+        }
+
+        public override MembershipPasswordFormat PasswordFormat
+        {
+            get
+            {
+                return this._passwordFormat;
+            }
+        }
+
+        public override string PasswordStrengthRegularExpression
+        {
+            get
+            {
+                return this._passwordStrengthRegularExpression;
+            }
+        }
+
+        public override bool RequiresQuestionAndAnswer
+        {
+            get
+            {
+                return this._requiresQuestionAndAnswer;
+            }
+        }
+
+        public override bool RequiresUniqueEmail
+        {
+            get
+            {
+                return this._requiresUniqueEmail;
+            }
         }
     }
 }

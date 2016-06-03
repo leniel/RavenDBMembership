@@ -12,6 +12,7 @@ using Raven.Client;
 using Castle.MicroKernel.Registration;
 using System.Reflection;
 using System.IO;
+using RavenDBMembership.Provider;
 
 namespace RavenDBMembership.Web
 {
@@ -79,8 +80,13 @@ namespace RavenDBMembership.Web
 			{
 				DataDirectory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, @"App_Data\RavenDB")
 			};
+
 			documentStore.Initialize();
-			return documentStore;
+
+            RavenDBMembershipProvider.AttachTo(documentStore);
+            RavenDBRoleProvider.AttachTo(documentStore);
+
+            return documentStore;
 		}
 	}
 }
